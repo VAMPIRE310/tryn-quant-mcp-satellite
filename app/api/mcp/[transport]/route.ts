@@ -34,6 +34,48 @@ const handler = createMcpHandler(
       },
     );
 
+    server.tool(
+      'remote_exec',
+      'Sends a PowerShell or CLI command to the Home PC for remote execution',
+      { command: z.string().describe('The command to run on the home PC') },
+      async ({ command }) => {
+        const supabase = createClient(
+          process.env.VITE_SUPABASE_URL!,
+          process.env.VITE_SUPABASE_ANON_KEY!
+        );
+
+        // 1. Insert command into relay
+        const { data, error } = await supabase
+          .from('remote_commands')
+          .insert([{ command }])
+          .select()
+          .single();
+
+        if (error) return { content: [{ type: 'text', text: `❌ Relay Error: ${error.message}` }], isError: true };
+
+        // 2. Poll for results (Max 30 seconds for Vercel timeout safety)
+        let attempts = 0;
+        while (attempts < 15) {
+          await new Promise(r => setTimeout(r, 2000));
+          const { data: result } = await supabase
+            .from('remote_commands')
+            .select('*')
+            .eq('id', data.id)
+            .single();
+
+          if (result && result.status === 'completed') {
+            return { content: [{ type: 'text', text: `✅ Execution Complete:\n\n${result.output}` }] };
+          }
+          if (result && result.status === 'failed') {
+            return { content: [{ type: 'text', text: `❌ Execution Failed:\n\n${result.error}` }], isError: true };
+          }
+          attempts++;
+        }
+
+        return { content: [{ type: 'text', text: `⏳ Command sent (ID: ${data.id}), but execution is still in progress. Check status later.` }] };
+      },
+    );
+
     // Placeholder for future trading-specific tools
     server.tool(
       'ping_backend',
