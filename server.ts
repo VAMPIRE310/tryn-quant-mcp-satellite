@@ -652,11 +652,10 @@ const SAT_API_KEY = process.env.SAT_API_KEY ?? "";
 function checkAuth(req: express.Request, res: express.Response): boolean {
   if (!SAT_API_KEY) return true;
   const auth = req.headers["authorization"];
-  if (!auth || auth !== `Bearer ${SAT_API_KEY}`) {
-    res.status(401).json({ error: "Unauthorized" });
-    return false;
-  }
-  return true;
+  const queryKey = req.query.key as string | undefined;
+  if ((auth && auth === `Bearer ${SAT_API_KEY}`) || queryKey === SAT_API_KEY) return true;
+  res.status(401).json({ error: "Unauthorized" });
+  return false;
 }
 
 app.all("/mcp", async (req, res) => {
