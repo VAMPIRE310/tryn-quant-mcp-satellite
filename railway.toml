@@ -1,6 +1,5 @@
 [build]
-builder = "NIXPACKS"
-buildCommand = "npm install --no-audit --no-fund"
+builder = "DOCKERFILE"
 
 [deploy]
 startCommand = "npm start"
