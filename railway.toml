@@ -1,5 +1,6 @@
 [build]
 builder = "NIXPACKS"
+buildCommand = "npm install --no-audit --no-fund"
 
 [deploy]
 startCommand = "npm start"
