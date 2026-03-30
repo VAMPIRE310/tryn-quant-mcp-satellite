@@ -1,35 +1,51 @@
-import { z } from 'zod';
-import { createMcpHandler } from 'mcp-handler';
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+  ErrorCode,
+  McpError
+} from "@modelcontextprotocol/sdk/types.js";
 
-const handler = createMcpHandler(
-  (server) => {
-    server.tool(
-      'roll_dice',
-      'Rolls an N-sided die',
-      { sides: z.number().int().min(2).default(6) },
-      async ({ sides }) => {
-        const value = 1 + Math.floor(Math.random() * sides);
-        return {
-          content: [{ type: 'text', text: `🎲 You rolled a ${value}!` }],
-        };
-      },
-    );
+function createServer() {
+  const server = new Server(
+    { name: "tryn-quant-mcp", version: "1.0.0" },
+    { capabilities: { tools: {} } }
+  );
 
-    server.tool(
-      'status_check',
-      'Checks the status of the MCP server',
-      {},
-      async () => {
-        return {
-          content: [{ type: 'text', text: '✅ MCP Server is online and stable!' }],
-        };
-      },
-    );
-  },
-  {},
-  { basePath: '/api/mcp' },
-);
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: "status_check",
+        description: "Checks the status of the satellite MCP server",
+        inputSchema: { type: "object", properties: {} }
+      }
+    ]
+  }));
 
-export const GET = async (req: Request) => (handler as any)(req);
-export const POST = async (req: Request) => (handler as any)(req);
-export const DELETE = async (req: Request) => (handler as any)(req);
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    if (request.params.name === "status_check") {
+      return {
+        content: [{ type: "text", text: "Satellite MCP Server is online and stable!" }]
+      };
+    }
+    throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`);
+  });
+
+  return server;
+}
+
+async function handleMcpRequest(request: Request): Promise<Response> {
+  const transport = new WebStandardStreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+  });
+  const server = createServer();
+  await server.connect(transport);
+  const response = await transport.handleRequest(request);
+  await server.close();
+  return response;
+}
+
+export const GET = handleMcpRequest;
+export const POST = handleMcpRequest;
+export const DELETE = handleMcpRequest;
