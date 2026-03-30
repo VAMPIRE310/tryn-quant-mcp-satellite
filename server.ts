@@ -54,9 +54,28 @@ const SB_SERVICE_KEY = process.env.SB_SERVICE_KEY ?? "";
 const SB_PROJECT_REF = process.env.SB_PROJECT_REF ?? "";
 const DATABASE_URL   = process.env.DATABASE_URL   ?? "";
 
-const pgPool = DATABASE_URL
-  ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 5 })
-  : null;
+// Build pg Pool — prefer individual params to avoid URL-encoding issues
+function buildPgPool(): Pool | null {
+  const host = process.env.DB_HOST;
+  const user = process.env.DB_USER;
+  const pass = process.env.DB_PASS;
+  if (host && user && pass) {
+    return new Pool({
+      host,
+      port: parseInt(process.env.DB_PORT ?? "6543"),
+      user,
+      password: pass,
+      database: process.env.DB_NAME ?? "postgres",
+      ssl: { rejectUnauthorized: false },
+      max: 5,
+    });
+  }
+  if (DATABASE_URL) {
+    return new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 5 });
+  }
+  return null;
+}
+const pgPool = buildPgPool();
 
 async function sbSQL(sql: string) {
   if (!pgPool) throw new Error("DATABASE_URL not set — cannot execute SQL");
