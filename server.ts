@@ -68,24 +68,85 @@ function buildPgPool(): Pool | null {
       database: process.env.DB_NAME ?? "postgres",
       ssl: { rejectUnauthorized: false },
       max: 5,
+      connectionTimeoutMillis: 8000,
     });
   }
   if (DATABASE_URL) {
-    return new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 5 });
+    return new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 5, connectionTimeoutMillis: 8000 });
   }
   return null;
 }
 const pgPool = buildPgPool();
 
-async function sbSQL(sql: string) {
-  if (!pgPool) throw new Error("DATABASE_URL not set — cannot execute SQL");
-  const client = await pgPool.connect();
-  try {
-    const result = await client.query(sql);
-    return { rows: result.rows, rowCount: result.rowCount, fields: result.fields?.map(f => f.name) };
-  } finally {
-    client.release();
+// REST-based SQL fallback — supports basic SELECT queries against public schema tables.
+// Used when the pg pool connection fails (e.g. wrong DB password in pooler).
+async function sbSQLViaRest(sql: string): Promise<{ rows: unknown[]; rowCount: number; fields: string[]; note: string }> {
+  const trimmed = sql.trim().replace(/;$/, "").trim();
+
+  if (/information_schema|pg_catalog|pg_log/i.test(trimmed)) {
+    throw new Error(
+      "System schema queries require a direct pg connection (unavailable). " +
+      "Fix DB_PASS: Supabase Dashboard → Settings → Database → Connection pooling → copy password."
+    );
   }
+
+  const m = trimmed.match(/^SELECT\s+([\s\S]+?)\s+FROM\s+["'`]?(\w+)["'`]?([\s\S]*)$/i);
+  if (!m) {
+    throw new Error(
+      "pg pool unavailable (pooler auth error — check DB_PASS in Railway env vars). " +
+      "REST fallback supports only basic SELECT … FROM <table> queries. " +
+      "Fix: Supabase Dashboard → Settings → Database → Connection pooling → copy password → update DB_PASS."
+    );
+  }
+
+  const [, cols, table, rest] = m;
+  const params = new URLSearchParams({ select: cols.trim() });
+
+  const limitMatch = rest.match(/LIMIT\s+(\d+)/i);
+  params.set("limit", limitMatch ? limitMatch[1] : "100");
+
+  const orderMatch = rest.match(/ORDER\s+BY\s+(\w+)(\s+DESC|\s+ASC)?/i);
+  if (orderMatch) {
+    const dir = (orderMatch[2]?.trim() ?? "ASC").toLowerCase();
+    params.set("order", `${orderMatch[1]}.${dir}`);
+  }
+
+  const whereStr = rest.match(/WHERE\s+(\w+)\s*=\s*'([^']*)'/i);
+  const whereNum = rest.match(/WHERE\s+(\w+)\s*=\s*(\d+)/i);
+  if (whereStr) params.append(whereStr[1], `eq.${whereStr[2]}`);
+  else if (whereNum) params.append(whereNum[1], `eq.${whereNum[2]}`);
+
+  const rows = await sbFetch(`/rest/v1/${table}?${params.toString()}`) as unknown[];
+  if (!Array.isArray(rows)) throw new Error(`REST error: ${JSON.stringify(rows).substring(0, 300)}`);
+
+  return {
+    rows,
+    rowCount: rows.length,
+    fields: rows.length > 0 ? Object.keys(rows[0] as object) : [],
+    note: "⚠ Via REST API fallback (pg pool unavailable — fix DB_PASS in Railway env vars)",
+  };
+}
+
+async function sbSQL(sql: string) {
+  if (pgPool) {
+    try {
+      const client = await pgPool.connect();
+      try {
+        const result = await client.query(sql);
+        return { rows: result.rows, rowCount: result.rowCount, fields: result.fields?.map(f => f.name) };
+      } finally {
+        client.release();
+      }
+    } catch (pgErr: any) {
+      const msg = String(pgErr?.message ?? pgErr);
+      // Only fall through on connection/auth errors — propagate real query errors
+      if (!msg.includes("Tenant or user") && !msg.includes("ENETUNREACH") &&
+          !msg.includes("timeout") && !msg.includes("ECONNREFUSED") && !msg.includes("ENOTFOUND")) {
+        throw pgErr;
+      }
+    }
+  }
+  return sbSQLViaRest(sql);
 }
 
 async function sbFetch(path: string, options: RequestInit = {}) {
@@ -493,9 +554,24 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
 
     case "supabase_list_tables": {
       const schema = (args.schema as string) ?? "public";
-      return await sbSQL(
-        `SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = '${schema.replace(/'/g, "''")}' ORDER BY table_name`
-      );
+      try {
+        return await sbSQL(
+          `SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = '${schema.replace(/'/g, "''")}' ORDER BY table_name`
+        );
+      } catch {
+        // pg unavailable or system schema not exposed via REST — use PostgREST OpenAPI spec
+        const spec = await sbFetch("/rest/v1/") as { definitions?: Record<string, unknown> };
+        const tables = Object.keys(spec.definitions ?? {}).sort().map(name => ({
+          table_name: name,
+          table_type: "BASE TABLE",
+        }));
+        return {
+          rows: tables,
+          rowCount: tables.length,
+          fields: ["table_name", "table_type"],
+          note: "⚠ Via PostgREST OpenAPI spec (pg unavailable — fix DB_PASS in Railway env vars)",
+        };
+      }
     }
 
     case "supabase_get_logs": {
@@ -535,8 +611,9 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
         services: {
           vercel: !!VCL_TOKEN,
           railway: !!RW_TOKEN,
-          supabase: !!SB_SERVICE_KEY,
+          supabase_rest: !!SB_SERVICE_KEY,
           supabase_sql: !!pgPool,
+          supabase_sql_mode: pgPool ? "direct-pg (preferred)" : "rest-fallback (fix DB_PASS)",
         },
         timestamp: new Date().toISOString(),
       };
