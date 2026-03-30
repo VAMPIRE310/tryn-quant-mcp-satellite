@@ -47,21 +47,26 @@ async function rwGQL(query: string, variables: Record<string, unknown> = {}) {
 }
 
 // ─── Supabase ─────────────────────────────────────────────────────────────────
+import { Pool } from "pg";
+
 const SB_URL         = process.env.SB_URL         ?? "";
 const SB_SERVICE_KEY = process.env.SB_SERVICE_KEY ?? "";
 const SB_PROJECT_REF = process.env.SB_PROJECT_REF ?? "";
-const SB_MGMT_TOKEN  = process.env.SB_MGMT_TOKEN  ?? "";
+const DATABASE_URL   = process.env.DATABASE_URL   ?? "";
+
+const pgPool = DATABASE_URL
+  ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 5 })
+  : null;
 
 async function sbSQL(sql: string) {
-  if (!SB_MGMT_TOKEN) throw new Error("SB_MGMT_TOKEN not set — generate one at supabase.com/dashboard/account/tokens");
-  const res = await fetch(`https://api.supabase.com/v1/projects/${SB_PROJECT_REF}/database/query`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${SB_MGMT_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ query: sql }),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(`Supabase SQL: ${JSON.stringify(data)}`);
-  return data;
+  if (!pgPool) throw new Error("DATABASE_URL not set — cannot execute SQL");
+  const client = await pgPool.connect();
+  try {
+    const result = await client.query(sql);
+    return { rows: result.rows, rowCount: result.rowCount, fields: result.fields?.map(f => f.name) };
+  } finally {
+    client.release();
+  }
 }
 
 async function sbFetch(path: string, options: RequestInit = {}) {
@@ -246,7 +251,7 @@ const TOOLS: Tool[] = [
   // ── Supabase (6) ────────────────────────────────────────────────────────────
   {
     name: "supabase_query",
-    description: "Execute arbitrary SQL against the Supabase database (requires SB_MGMT_TOKEN)",
+    description: "Execute arbitrary SQL against the Supabase database",
     inputSchema: {
       type: "object",
       required: ["sql"],
@@ -263,7 +268,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "supabase_get_logs",
-    description: "Get logs for a Supabase service (requires SB_MGMT_TOKEN)",
+    description: "Get logs for a Supabase service (postgres logs via direct SQL)",
     inputSchema: {
       type: "object",
       required: ["service"],
@@ -475,15 +480,18 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
     }
 
     case "supabase_get_logs": {
-      if (!SB_MGMT_TOKEN) throw new Error("SB_MGMT_TOKEN not set");
+      // Query pg_log via direct SQL since management API needs PAT
+      const service = args.service as string;
       const limit = (args.limit as number) ?? 100;
-      const res = await fetch(
-        `https://api.supabase.com/v1/projects/${SB_PROJECT_REF}/logs?service=${args.service}&limit=${limit}`,
-        { headers: { Authorization: `Bearer ${SB_MGMT_TOKEN}` } }
-      );
-      const data = await res.json();
-      if (!res.ok) throw new Error(`Supabase logs: ${JSON.stringify(data)}`);
-      return data;
+      // Map service names to pg log queries
+      const logQuery = service === "postgres"
+        ? `SELECT log_time, error_severity, message FROM pg_catalog.pg_logs ORDER BY log_time DESC LIMIT ${limit}`
+        : `SELECT log_time, error_severity, message FROM extensions.pg_log WHERE message ILIKE '%${service}%' ORDER BY log_time DESC LIMIT ${limit}`;
+      try {
+        return await sbSQL(logQuery);
+      } catch {
+        return { note: `Log query for '${service}' not available via direct SQL. Use the Supabase dashboard for ${service} logs.` };
+      }
     }
 
     case "supabase_list_auth_users": {
@@ -509,7 +517,7 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
           vercel: !!VCL_TOKEN,
           railway: !!RW_TOKEN,
           supabase: !!SB_SERVICE_KEY,
-          supabase_sql: !!SB_MGMT_TOKEN,
+          supabase_sql: !!pgPool,
         },
         timestamp: new Date().toISOString(),
       };
