@@ -41,6 +41,10 @@ function connect() {
         case "local_list_dir":
           result = await handleListDir(request.params.path);
           break;
+        case "local_machine_info":
+          result = await handleMachineInfo();
+          result = await handleListDir(request.params.path);
+          break;
         default:
           result = { error: "Unknown method" };
       }
@@ -103,6 +107,24 @@ async function handleListDir(dirPath: string) {
         name: e.name,
         type: e.isDirectory() ? "dir" : "file"
       }))
+    };
+  } catch (err: any) {
+    return { error: err.message };
+  }
+}
+
+
+async function handleMachineInfo() {
+  try {
+    const { stdout: gpu } = await handleShell("nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits") as any;
+    const { stdout: disk } = await handleShell("wmic logicaldisk get size,freespace,caption") as any;
+    const uptime = process.uptime();
+    return {
+      machineId: MACHINE_ID,
+      gpu: gpu?.trim(),
+      disk: disk?.trim(),
+      uptime: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`,
+      status: "online"
     };
   } catch (err: any) {
     return { error: err.message };

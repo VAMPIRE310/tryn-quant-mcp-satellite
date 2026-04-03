@@ -170,6 +170,17 @@ async function sbFetch(path: string, options: RequestInit = {}) {
 const TOOLS: Tool[] = [
   // ── Local Bridge (4) ──────────────────────────────────────────────────────────────
     {
+          {
+      name: "local_machine_info",
+      description: "Get status info from a connected local machine (GPU, Disk, Uptime)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          machineId: { type: "string" }
+        },
+      },
+    },
+    {
       name: "local_shell",
       description: "Run a shell command on a connected local machine",
       inputSchema: {
@@ -683,6 +694,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
     }
 
     
+            case "local_machine_info":
+        return await callBridge(args.machineId as string, "local_machine_info", {});
       case "local_shell":
         return await callBridge(args.machineId as string, "local_shell", { command: args.command });
       case "local_read_file":
