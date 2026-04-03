@@ -1,6 +1,8 @@
 import express from "express";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { WebSocketServer, WebSocket } from "ws";
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
@@ -166,7 +168,58 @@ async function sbFetch(path: string, options: RequestInit = {}) {
 
 // ─── Tool Definitions ─────────────────────────────────────────────────────────
 const TOOLS: Tool[] = [
-  // ── Vercel (6) ──────────────────────────────────────────────────────────────
+  // ── Local Bridge (4) ──────────────────────────────────────────────────────────────
+    {
+      name: "local_shell",
+      description: "Run a shell command on a connected local machine",
+      inputSchema: {
+        type: "object",
+        required: ["command"],
+        properties: {
+          command: { type: "string" },
+          machineId: { type: "string", description: "Target machine ID (default: RTX4090-CORE)" }
+        },
+      },
+    },
+    {
+      name: "local_read_file",
+      description: "Read a file from a connected local machine",
+      inputSchema: {
+        type: "object",
+        required: ["path"],
+        properties: {
+          path: { type: "string" },
+          machineId: { type: "string" }
+        },
+      },
+    },
+    {
+      name: "local_write_file",
+      description: "Write a file to a connected local machine",
+      inputSchema: {
+        type: "object",
+        required: ["path", "content"],
+        properties: {
+          path: { type: "string" },
+          content: { type: "string" },
+          machineId: { type: "string" }
+        },
+      },
+    },
+    {
+      name: "local_list_dir",
+      description: "List directory contents on a connected local machine",
+      inputSchema: {
+        type: "object",
+        required: ["path"],
+        properties: {
+          path: { type: "string" },
+          machineId: { type: "string" }
+        },
+      },
+    },
+
+    // ── Vercel (6) ──────────────────────────────────────────────────────────────
   {
     name: "vercel_list_projects",
     description: "List all Vercel projects with latest deployment info",
@@ -396,6 +449,32 @@ const TOOLS: Tool[] = [
 ];
 
 // ─── Tool Handlers ────────────────────────────────────────────────────────────
+
+// ─── Bridge Management ───────────────────────────────────────────────────────
+const bridgeConnections = new Map<string, WebSocket>();
+const pendingCallbacks = new Map<string, (result: any) => void>();
+
+async function callBridge(machineId: string, method: string, params: any): Promise<any> {
+  const targetId = machineId || "RTX4090-CORE";
+  const ws = bridgeConnections.get(targetId);
+  if (!ws) throw new Error(`Machine ${targetId} not connected to bridge.`);
+
+  const id = Math.random().toString(36).substring(7);
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      pendingCallbacks.delete(id);
+      reject(new Error("Bridge request timed out"));
+    }, 30000);
+
+    pendingCallbacks.set(id, (result) => {
+      clearTimeout(timeout);
+      resolve(result);
+    });
+
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+}
+
 async function handleTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
 
@@ -603,7 +682,17 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
       return await sbFetch(`/rest/v1/${table}?select=${encodeURIComponent(select)}&limit=${limit}${filter}`);
     }
 
-    case "status_check":
+    
+      case "local_shell":
+        return await callBridge(args.machineId as string, "local_shell", { command: args.command });
+      case "local_read_file":
+        return await callBridge(args.machineId as string, "local_read_file", { path: args.path });
+      case "local_write_file":
+        return await callBridge(args.machineId as string, "local_write_file", { path: args.path, content: args.content });
+      case "local_list_dir":
+        return await callBridge(args.machineId as string, "local_list_dir", { path: args.path });
+
+      case "status_check":
       return {
         status: "online",
         version: "2.0.0",
@@ -642,41 +731,49 @@ function createMcpServer() {
   });
   return server;
 }
-
 // ─── Express App ──────────────────────────────────────────────────────────────
-const app = express();
-app.use(express.json());
 
-const SAT_API_KEY = process.env.SAT_API_KEY ?? "";
+const isStdio = process.argv.includes("--stdio");
 
-function checkAuth(req: express.Request, res: express.Response): boolean {
-  if (!SAT_API_KEY) return true;
-  const auth = req.headers["authorization"];
-  const queryKey = req.query.key as string | undefined;
-  if ((auth && auth === `Bearer ${SAT_API_KEY}`) || queryKey === SAT_API_KEY) return true;
-  res.status(401).json({ error: "Unauthorized" });
-  return false;
-}
-
-app.all("/mcp", async (req, res) => {
-  if (!checkAuth(req, res)) return;
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+if (isStdio) {
   const server = createMcpServer();
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
-  res.on("finish", () => server.close().catch(() => {}));
-});
+  const transport = new StdioServerTransport();
+  server.connect(transport).catch(console.error);
+  console.error("MCP satellite v2.0.0 running on Stdio");
+} else {
+  const app = express();
+  app.use(express.json());
 
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", version: "2.0.0", uptime: process.uptime() });
-});
+  const SAT_API_KEY = process.env.SAT_API_KEY ?? "";
 
-app.get("/", (_req, res) => {
-  res.json({ name: "tryn-quant-mcp-satellite", version: "2.0.0", endpoint: "/mcp" });
-});
+  function checkAuth(req, res) {
+    if (!SAT_API_KEY) return true;
+    const auth = req.headers["authorization"];
+    const queryKey = req.query.key;
+    if ((auth && auth === `Bearer ${SAT_API_KEY}`) || queryKey === SAT_API_KEY) return true;
+    res.status(401).json({ error: "Unauthorized" });
+    return false;
+  }
 
-const PORT = parseInt(process.env.PORT ?? "3000");
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`MCP satellite v2.0.0 running on port ${PORT}`);
-  console.log(`Vercel: ${!!VCL_TOKEN} | Railway: ${!!RW_TOKEN} | Supabase: ${!!SB_SERVICE_KEY}`);
-});
+  const httpMainServer = createMcpServer();
+
+  app.all("/mcp", async (req, res) => {
+    if (!checkAuth(req, res)) return;
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    await httpMainServer.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  });
+
+  app.get("/health", (_req, res) => {
+    res.json({ status: "ok", version: "2.0.0", uptime: process.uptime() });
+  });
+
+  app.get("/", (_req, res) => {
+    res.json({ name: "tryn-quant-mcp-satellite", version: "2.0.0", endpoint: "/mcp" });
+  });
+
+  const PORT = parseInt(process.env.PORT ?? "3000");
+  app.listen(PORT, "0.0.0.0", () => {
+    console.error(`MCP satellite v2.0.0 running on port ${PORT}`);
+  });
+}
