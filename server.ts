@@ -170,7 +170,6 @@ async function sbFetch(path: string, options: RequestInit = {}) {
 const TOOLS: Tool[] = [
   // ── Local Bridge (4) ──────────────────────────────────────────────────────────────
     {
-          {
       name: "local_machine_info",
       description: "Get status info from a connected local machine (GPU, Disk, Uptime)",
       inputSchema: {
